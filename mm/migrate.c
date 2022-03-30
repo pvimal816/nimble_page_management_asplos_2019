@@ -49,8 +49,9 @@
 #include <linux/sched/mm.h>
 #include <linux/ptrace.h>
 #include <linux/oom.h>
-
 #include <asm/tlbflush.h>
+#include <linux/semaphore.h>
+#include <linux/gfp.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/migrate.h>
@@ -606,7 +607,7 @@ static void __copy_gigantic_page(struct page *dst, struct page *src,
 	}
 }
 
-static void copy_huge_page(struct page *dst, struct page *src,
+noinline static void copy_huge_page(struct page *dst, struct page *src,
 				enum migrate_mode mode)
 {
 	int i;
@@ -713,16 +714,27 @@ void migrate_page_copy(struct page *newpage, struct page *page,
 {
 	int rc = -EFAULT;
 
-	if (PageHuge(page) || PageTransHuge(page))
+	if (PageHuge(page) || PageTransHuge(page)){
+		trace_printk("calling copy_huge_page()!");
 		copy_huge_page(newpage, page, mode);
+		trace_printk("copy_huge_page() returned!");
+	}
 	else {
-		if (mode & MIGRATE_DMA)
+		if (mode & MIGRATE_DMA){
+			trace_printk("calling copy_page_dma()!");
 			rc = copy_page_dma(newpage, page, 1);
-		else if (mode & MIGRATE_MT)
+			trace_printk("copy_page_dma() returned!");
+		}
+		else if (mode & MIGRATE_MT){
+			trace_printk("calling copy_page_multithread()!");
 			rc = copy_page_multithread(newpage, page, 1);
-
-		if (rc)
+			trace_printk("copy_page_multithread() returned!");
+		}
+		if (rc){
+			trace_printk("calling copy_highpage()!");
 			copy_highpage(newpage, page);
+			trace_printk("copy_highpage() returned!");
+		}
 	}
 
 	migrate_page_states(newpage, page);
@@ -2284,16 +2296,158 @@ static int store_status(int __user *status, int start, int value, int nr)
 	return 0;
 }
 
+/**
+ * @brief This Syscall can be used to pass information about PMEM memory nodes.
+ * One of the argument should be the list of integers where ith integer is the 
+ * nearest CPU node id for ith node if that node is a PMEM node.
+ * Otherwise it should be -1.
+ */
+int CLOSEST_CPU_NODE_FOR_PMEM[MAX_NUMNODES];
+int CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED=0;
+
+SYSCALL_DEFINE2(init_closest_cpu_node_for_pmem_list, const int __user*, closest_cpu_node_for_pmemp, int, entry_count){
+	int i;
+	int ret = 0;
+	char *tempstr = (char*)kmalloc(1024, GFP_KERNEL);
+
+	printk("Syscall init_closest_cpu_node_for_pmem_list called!");
+	
+	if(MAX_NUMNODES!=entry_count)
+		return -1;
+	
+	if(copy_from_user(CLOSEST_CPU_NODE_FOR_PMEM, closest_cpu_node_for_pmemp, sizeof(int)*entry_count)){
+		ret = -1;
+		goto out;
+	}
+
+	CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED = 1;
+	
+	sprintf(tempstr, "closest_cpu_node_for_pmemp=[");
+	for(i=0; i<entry_count; i++){
+		sprintf(tempstr, "%d, ", CLOSEST_CPU_NODE_FOR_PMEM[i]);
+	}
+	sprintf(tempstr, "]");
+	printk("%s", tempstr);
+
+out:
+	kfree(tempstr);
+	return ret;
+}
+
+int get_current_cpu_node(void);
+
+int get_current_cpu_node(){
+	int cpu = raw_smp_processor_id();
+	int node = cpu_to_node(cpu);
+	return node;
+}
+
+/**
+ * @brief Returns the id of the nearest cpu node of this node.
+ * Because in some cases the given NUMA node might be a memory only NUMA node
+ * for which it's non-trivial to find the corresponding CPU node.
+ * @return int 
+ */
+int get_nearest_cpu_node(int node);
+
+int get_nearest_cpu_node(int node){
+	if(!CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED || node < 0 || node >= MAX_NUMNODES)
+		return -1;
+	return CLOSEST_CPU_NODE_FOR_PMEM[node];
+}
+
+int is_remote_pmem_node(int node){
+	int cur_cpu = get_current_cpu_node();
+	int nearest_cpu = get_nearest_cpu_node(node);
+	if(!CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED)
+		// information about pmem nodes not available, 
+		// use init_closest_cpu_node_for_pmem_list to provide it.
+		return -1;
+	if(nearest_cpu==cur_cpu)
+		// local node not a remote one
+		return 0;
+	if(nearest_cpu==-1)
+		// not a pmem node
+		return 0;
+	return 1;
+}
+
+typedef struct {
+	struct work_struct work;
+	// extra data;
+	// TODO: declare a lock over here 
+	// so when the work gets finished the worker will unlock it.
+	struct mm_struct *mm;
+	struct list_head *pagelist;
+	u_int8_t node;
+	u_int8_t migrate_mt;
+	u_int8_t migrate_dma;
+	u_int8_t migrate_concur;
+	struct semaphore *sem;
+} page_migration_to_remote_pmm_work_t;
+
+/**
+ * @brief This function is a worker which 
+ * carries out the actual page migration.
+ */
+static void page_migration_to_remote_pmm_worker(struct work_struct *work){
+	// TODO: implement this
+	page_migration_to_remote_pmm_work_t* work_info = (page_migration_to_remote_pmm_work_t*) work;
+	printk("page_migration_to_remote_pmm_worker called!");
+	// TODO: invoke the page migration here
+	// signal the task assigner
+	up(work_info->sem);
+}
+
 static int do_move_pages_to_node(struct mm_struct *mm,
 		struct list_head *pagelist, int node,
 		bool migrate_mt, bool migrate_dma, bool migrate_concur)
 {
-	int err;
-
+	int err=0;
+	
 	if (list_empty(pagelist))
 		return 0;
+	/**
+	 * Here check if the target node is remote PMEM.
+	 * If so, schedule a work into that node specific work queue.
+	 * For each PMEM node there is one work queue whose threads
+	 * run on that CPU of that node.
+	 * Also, until the work gets finished we need to sleep, so, 
+	 * the worker needs to wake this process when it finishes.
+	 * Work item must contain atleast following information:
+	 * 	- source pagelist
+	 *  - process id
+	 *  - node
+	 *  - page allocation function ?
+	 *  - all other parameters passed to migrate_* functions.
+	 * 
+	 * Worker threads just needs to call appropiate migrate_* call 
+	 * and then wakeup this process at the end.
+	 */
+	if(is_remote_pmem_node(node)){
+		// TODO: schedule the task to appropriate work queue
+		//TODO: check if we need to tune the workqueue params
+		struct workqueue_struct *page_migration_to_remote_pmm_wq = alloc_workqueue("page_migration_to_remote_pmm_wq", 0, 0);
+		page_migration_to_remote_pmm_work_t work;
+		if (unlikely(!page_migration_to_remote_pmm_wq)) {
+			err = -ENOMEM;
+			goto out;
+		}
+		// initialize work
+		INIT_WORK(&(work.work), page_migration_to_remote_pmm_worker);
+		work.mm = mm;
+		work.pagelist = pagelist;
+		work.node = node;
+		work.migrate_mt = migrate_mt;
+		work.migrate_dma = migrate_dma;
+		work.migrate_concur = migrate_concur;
+		sema_init(work.sem, 0);
 
-	if (migrate_concur) {
+		queue_work_on(get_nearest_cpu_node(node), page_migration_to_remote_pmm_wq, (struct work_struct*)&work);
+		down(work.sem);
+		flush_workqueue(page_migration_to_remote_pmm_wq);
+		destroy_workqueue(page_migration_to_remote_pmm_wq);
+	} else if (migrate_concur) {
 		err = migrate_pages_concur(pagelist, alloc_new_node_page, NULL, node,
 				MIGRATE_SYNC | (migrate_mt ? MIGRATE_MT : MIGRATE_SINGLETHREAD) |
 				(migrate_dma ? MIGRATE_DMA : MIGRATE_SINGLETHREAD),
@@ -2305,6 +2459,8 @@ static int do_move_pages_to_node(struct mm_struct *mm,
 				(migrate_dma ? MIGRATE_DMA : MIGRATE_SINGLETHREAD),
 				MR_SYSCALL);
 	}
+
+out:
 	if (err)
 		putback_movable_pages(pagelist);
 	return err;
