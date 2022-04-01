@@ -2303,31 +2303,36 @@ static int store_status(int __user *status, int start, int value, int nr)
  * Otherwise it should be -1.
  */
 int CLOSEST_CPU_NODE_FOR_PMEM[MAX_NUMNODES];
-int CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED=0;
+int CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED_COUNT=0;
 
 SYSCALL_DEFINE2(init_closest_cpu_node_for_pmem_list, const int __user*, closest_cpu_node_for_pmemp, int, entry_count){
 	int i;
 	int ret = 0;
 	char *tempstr = (char*)kmalloc(1024, GFP_KERNEL);
 
-	printk("Syscall init_closest_cpu_node_for_pmem_list called!");
+	printk("Syscall init_closest_cpu_node_for_pmem_list called!\n");
 	
-	if(MAX_NUMNODES!=entry_count)
+	entry_count = min(MAX_NUMNODES, entry_count);
+	if(entry_count<=0){
+		printk("entry_count should be greater than 0: entry_count=%d\n", entry_count);
 		return -1;
-	
+	}
+
 	if(copy_from_user(CLOSEST_CPU_NODE_FOR_PMEM, closest_cpu_node_for_pmemp, sizeof(int)*entry_count)){
+		printk("Error in copy_from_user!\n");
 		ret = -1;
 		goto out;
 	}
 
-	CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED = 1;
+	CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED_COUNT = entry_count;
 	
-	sprintf(tempstr, "closest_cpu_node_for_pmemp=[");
-	for(i=0; i<entry_count; i++){
-		sprintf(tempstr, "%d, ", CLOSEST_CPU_NODE_FOR_PMEM[i]);
+	snprintf(tempstr, 1024-strlen(tempstr), "closest_cpu_node_for_pmemp=[");
+	// only print first 10 entries
+	for(i=0; i<min(entry_count, 10); i++){
+		snprintf(tempstr+strlen(tempstr), 1024-strlen(tempstr), "%d, ", CLOSEST_CPU_NODE_FOR_PMEM[i]);
 	}
-	sprintf(tempstr, "]");
-	printk("%s", tempstr);
+	snprintf(tempstr+strlen(tempstr)-(i>0 ? 2 : 0), 1024-strlen(tempstr), "]");
+	printk("%s\n", tempstr);
 
 out:
 	kfree(tempstr);
@@ -2351,7 +2356,7 @@ int get_current_cpu_node(){
 int get_nearest_cpu_node(int node);
 
 int get_nearest_cpu_node(int node){
-	if(!CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED || node < 0 || node >= MAX_NUMNODES)
+	if(CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED_COUNT<=node || node < 0 || node >= MAX_NUMNODES)
 		return -1;
 	return CLOSEST_CPU_NODE_FOR_PMEM[node];
 }
@@ -2359,10 +2364,14 @@ int get_nearest_cpu_node(int node){
 int is_remote_pmem_node(int node){
 	int cur_cpu = get_current_cpu_node();
 	int nearest_cpu = get_nearest_cpu_node(node);
-	if(!CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED)
+	if(CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED_COUNT<=node){
 		// information about pmem nodes not available, 
 		// use init_closest_cpu_node_for_pmem_list to provide it.
+		printk("is_remote_pmem_node called with node value %d"
+			" but the CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED_COUNT is %d.\n",
+			node, CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED_COUNT);
 		return -1;
+	}
 	if(nearest_cpu==cur_cpu)
 		// local node not a remote one
 		return 0;
@@ -2393,7 +2402,7 @@ typedef struct {
 static void page_migration_to_remote_pmm_worker(struct work_struct *work){
 	// TODO: implement this
 	page_migration_to_remote_pmm_work_t* work_info = (page_migration_to_remote_pmm_work_t*) work;
-	printk("page_migration_to_remote_pmm_worker called!");
+	printk("page_migration_to_remote_pmm_worker called!\n");
 	// TODO: invoke the page migration here
 	// signal the task assigner
 	up(work_info->sem);
@@ -2424,7 +2433,7 @@ static int do_move_pages_to_node(struct mm_struct *mm,
 	 * Worker threads just needs to call appropiate migrate_* call 
 	 * and then wakeup this process at the end.
 	 */
-	if(is_remote_pmem_node(node)){
+	if(is_remote_pmem_node(node)==1){
 		// TODO: schedule the task to appropriate work queue
 		//TODO: check if we need to tune the workqueue params
 		struct workqueue_struct *page_migration_to_remote_pmm_wq = alloc_workqueue("page_migration_to_remote_pmm_wq", 0, 0);

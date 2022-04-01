@@ -1432,4 +1432,7 @@ asmlinkage long sys_mm_manage(pid_t pid, unsigned long nr_pages,
 				const unsigned long __user *old_nodes,
 				const unsigned long __user *new_nodes,
 				int flags);
+asmlinkage long sys_init_closest_cpu_node_for_pmem_list(
+				const int __user* closest_cpu_node_for_pmemp,
+				int entry_count);
 #endif

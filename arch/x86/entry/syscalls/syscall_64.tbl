@@ -361,6 +361,7 @@
 438	common	pidfd_getfd		__x64_sys_pidfd_getfd
 439	common	exchange_pages	__x64_sys_exchange_pages
 440	common	mm_manage		__x64_sys_mm_manage
+441 common  init_closest_cpu_node_for_pmem_list __x64_sys_init_closest_cpu_node_for_pmem_list
 
 #
 # x32-specific system call numbers start at 512 to avoid cache impact
