@@ -327,6 +327,13 @@ extern int num_block_to_scan;
 
 static struct ctl_table kern_table[] = {
 	{
+		.procname = "enable_page_migration_optimization_avoid_remote_pmem_write",
+		.data = &sysctl_enable_page_migration_optimization_avoid_remote_pmem_write,
+		.maxlen = sizeof(int),
+		.mode = 0644,
+		.proc_handler = proc_dointvec,
+	},
+	{
 		.procname	= "sched_child_runs_first",
 		.data		= &sysctl_sched_child_runs_first,
 		.maxlen		= sizeof(unsigned int),
@@ -2041,7 +2048,7 @@ static struct ctl_table debug_table[] = {
 		.extra2		= SYSCTL_ONE,
 	},
 #endif
-	{ }
+	{ },
 };
 
 static struct ctl_table dev_table[] = {

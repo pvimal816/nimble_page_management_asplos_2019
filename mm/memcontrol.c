@@ -7193,8 +7193,8 @@ static ssize_t memory_per_node_max_write(struct kernfs_open_file *of,
 	return nbytes;
 }
 
-static struct cftype memcg_per_node_stats_files[N_MEMORY];
-static struct cftype memcg_per_node_max_files[N_MEMORY];
+static struct cftype memcg_per_node_stats_files[MAX_NUMNODES];
+static struct cftype memcg_per_node_max_files[MAX_NUMNODES];
 
 static int __init mem_cgroup_per_node_init(void)
 {

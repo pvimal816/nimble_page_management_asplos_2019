@@ -14,6 +14,8 @@
 #include "dax-private.h"
 #include "bus.h"
 
+extern char IS_PMEM_NODE[MAX_NUMNODES];
+extern int CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED;
 int dev_dax_kmem_probe(struct device *dev)
 {
 	struct dev_dax *dev_dax = to_dev_dax(dev);
@@ -32,10 +34,18 @@ int dev_dax_kmem_probe(struct device *dev)
 	 * unavoidable performance issues.
 	 */
 	numa_node = dev_dax->target_node;
+	printk("In dev_dax_kmem_probe and dev_dax->target_node is %d.\n", dev_dax->target_node);
 	if (numa_node < 0) {
 		dev_warn(dev, "rejecting DAX region %pR with invalid node: %d\n",
 			 res, numa_node);
 		return -EINVAL;
+	}
+
+	if(numa_node<MAX_NUMNODES){
+		CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED = 0;
+		IS_PMEM_NODE[numa_node] = 1;
+	}else{
+		printk("[dev_dax_kmem_probe] dev_dax->target_node is %d but IS_PMEM_NODE size is only %d.\n", dev_dax->target_node, MAX_NUMNODES);
 	}
 
 	/* Hotplug starting at the beginning of the next block: */

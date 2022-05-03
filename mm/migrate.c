@@ -2303,7 +2303,8 @@ static int store_status(int __user *status, int start, int value, int nr)
  * Otherwise it should be -1.
  */
 int CLOSEST_CPU_NODE_FOR_PMEM[MAX_NUMNODES];
-int CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED_COUNT=0;
+int CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED=0;
+EXPORT_SYMBOL(CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED);
 
 SYSCALL_DEFINE2(init_closest_cpu_node_for_pmem_list, const int __user*, closest_cpu_node_for_pmemp, int, entry_count){
 	int i;
@@ -2324,7 +2325,7 @@ SYSCALL_DEFINE2(init_closest_cpu_node_for_pmem_list, const int __user*, closest_
 		goto out;
 	}
 
-	CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED_COUNT = entry_count;
+	CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED = entry_count;
 	
 	snprintf(tempstr, 1024-strlen(tempstr), "closest_cpu_node_for_pmemp=[");
 	// only print first 10 entries
@@ -2337,6 +2338,84 @@ SYSCALL_DEFINE2(init_closest_cpu_node_for_pmem_list, const int __user*, closest_
 out:
 	kfree(tempstr);
 	return ret;
+}
+
+char IS_PMEM_NODE[MAX_NUMNODES];
+EXPORT_SYMBOL(IS_PMEM_NODE);
+
+void init_closest_cpu_node_for_pmem_list_kernel(void);
+
+void init_closest_cpu_node_for_pmem_list_kernel(){
+	if(CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED)
+		return;
+	// TODO: review this
+	int i, j, cpu, nid, cmin;
+	// char *is_active_node = (char*) kmalloc(MAX_NUMNODES, GFP_KERNEL);
+	char *is_cpu_node = (char*) kmalloc(MAX_NUMNODES, GFP_KERNEL);
+	// memset(is_active_node, 0, MAX_NUMNODES);
+
+	if(!is_cpu_node){
+		printk("Unable to initialize CLOSEST_CPU_NODE_FOR_PMEM: kernel memory allocation failed!\n");
+		return;
+	}
+
+	int *node_to_cpu = (int*) kmalloc(MAX_NUMNODES*sizeof(int), GFP_KERNEL);
+	if(!node_to_cpu){
+		printk("Unable to initialize CLOSEST_CPU_NODE_FOR_PMEM: kernel memory allocation failed!\n");
+		kfree(is_cpu_node);
+		return;
+	}
+
+	memset(is_cpu_node, 0, MAX_NUMNODES);
+	memset(node_to_cpu, -1, MAX_NUMNODES*sizeof(int));
+
+	// // find active nodes
+	// for_each_online_node(i)
+	// 	is_active_node[i] = 1;
+	
+	// find all cpu nodes
+	for_each_present_cpu(cpu) {
+		nid = cpu_to_node(cpu);
+		if (nid>=0 && nid<MAX_NUMNODES){
+			is_cpu_node[nid] = 1;
+			node_to_cpu[nid] = cpu;
+		}
+	}
+
+	printk("[init_closest_cpu_node_for_pmem_list_kernel] node having CPUs are: ");
+	for(i=0; i<MAX_NUMNODES; i++)
+		if(is_cpu_node[i])
+			printk(KERN_CONT "%d, ", i);
+	printk(KERN_CONT "\n");
+
+	// find for all pmem nodes the closest cpu node
+	for(i=0; i<MAX_NUMNODES; i++){
+		if(!IS_PMEM_NODE[i]){
+			CLOSEST_CPU_NODE_FOR_PMEM[i] = -1;
+			continue;
+		}
+		/**
+		 * Initialize cmin to 256 which is more than highest
+		 * possible distance between any two numa nodes.
+		 */
+		cmin = 256;
+		for(j=0; j<MAX_NUMNODES; j++){
+			if(is_cpu_node[j] && cmin>node_distance(i, j)){
+				cmin = node_distance(i, j);
+				CLOSEST_CPU_NODE_FOR_PMEM[i] = node_to_cpu[j];
+			}
+		}
+	}
+
+	printk("[init_closest_cpu_node_for_pmem_list_kernel] CLOSEST_CPU_NODE_FOR_PMEM: [");
+	for(i=0; i<MAX_NUMNODES; i++)
+		printk(KERN_CONT "%d%s", CLOSEST_CPU_NODE_FOR_PMEM[i], (i==(MAX_NUMNODES-1)?"":", "));
+	printk(KERN_CONT "]\n");
+
+	// free(is_active_node);
+	CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED = 1;
+	kfree(node_to_cpu);
+	kfree(is_cpu_node);
 }
 
 int get_current_cpu_node(void);
@@ -2356,7 +2435,8 @@ int get_current_cpu_node(){
 int get_nearest_cpu_node(int node);
 
 int get_nearest_cpu_node(int node){
-	if(CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED_COUNT<=node || node < 0 || node >= MAX_NUMNODES)
+	init_closest_cpu_node_for_pmem_list_kernel();
+	if(CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED==0 || node < 0 || node >= MAX_NUMNODES)
 		return -1;
 	return CLOSEST_CPU_NODE_FOR_PMEM[node];
 }
@@ -2364,12 +2444,12 @@ int get_nearest_cpu_node(int node){
 int is_remote_pmem_node(int node){
 	int cur_cpu = get_current_cpu_node();
 	int nearest_cpu = get_nearest_cpu_node(node);
-	if(CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED_COUNT<=node){
+	if(CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED==0){
 		// information about pmem nodes not available, 
 		// use init_closest_cpu_node_for_pmem_list to provide it.
 		printk("is_remote_pmem_node called with node value %d"
-			" but the CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED_COUNT is %d.\n",
-			node, CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED_COUNT);
+			" but the CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED is 0.\n",
+			node, CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED);
 		return -1;
 	}
 	if(nearest_cpu==cur_cpu)
@@ -2404,64 +2484,82 @@ static void page_migration_to_remote_pmm_worker(struct work_struct *work){
 	page_migration_to_remote_pmm_work_t* work_info = (page_migration_to_remote_pmm_work_t*) work;
 	printk("page_migration_to_remote_pmm_worker called!\n");
 	// TODO: invoke the page migration here
+	migrate_pages(work_info->pagelist, alloc_new_node_page, NULL, work_info->node,
+				MIGRATE_SYNC | (work_info->migrate_mt ? MIGRATE_MT : MIGRATE_SINGLETHREAD) |
+				(work_info->migrate_dma ? MIGRATE_DMA : MIGRATE_SINGLETHREAD),
+				MR_SYSCALL);
 	// signal the task assigner
 	up(work_info->sem);
 }
+
+int sysctl_enable_page_migration_optimization_avoid_remote_pmem_write = 0;
 
 static int do_move_pages_to_node(struct mm_struct *mm,
 		struct list_head *pagelist, int node,
 		bool migrate_mt, bool migrate_dma, bool migrate_concur)
 {
-	int err=0;
-	
+	int err=0, nearest_node;
+	extern struct workqueue_struct *page_migration_to_remote_pmm_wq;
+	page_migration_to_remote_pmm_work_t *work;
+
 	if (list_empty(pagelist))
-		return 0;
-	/**
-	 * Here check if the target node is remote PMEM.
-	 * If so, schedule a work into that node specific work queue.
-	 * For each PMEM node there is one work queue whose threads
-	 * run on that CPU of that node.
-	 * Also, until the work gets finished we need to sleep, so, 
-	 * the worker needs to wake this process when it finishes.
-	 * Work item must contain atleast following information:
-	 * 	- source pagelist
-	 *  - process id
-	 *  - node
-	 *  - page allocation function ?
-	 *  - all other parameters passed to migrate_* functions.
-	 * 
-	 * Worker threads just needs to call appropiate migrate_* call 
-	 * and then wakeup this process at the end.
-	 */
-	if(is_remote_pmem_node(node)==1){
+		goto out;
+
+	printk("do_move_pages_to_node called, with destination node=%d.\n", node);
+	if(sysctl_enable_page_migration_optimization_avoid_remote_pmem_write==1 && 
+		is_remote_pmem_node(node)==1
+	){
 		// TODO: schedule the task to appropriate work queue
 		//TODO: check if we need to tune the workqueue params
-		struct workqueue_struct *page_migration_to_remote_pmm_wq = alloc_workqueue("page_migration_to_remote_pmm_wq", 0, 0);
-		page_migration_to_remote_pmm_work_t work;
+		printk("is_remote_pmem_node(%d) returned 1!\n", node);
 		if (unlikely(!page_migration_to_remote_pmm_wq)) {
+			printk("page_migration_to_remote_pmm_wq not initialized!\n");
 			err = -ENOMEM;
 			goto out;
 		}
+		
 		// initialize work
-		INIT_WORK(&(work.work), page_migration_to_remote_pmm_worker);
-		work.mm = mm;
-		work.pagelist = pagelist;
-		work.node = node;
-		work.migrate_mt = migrate_mt;
-		work.migrate_dma = migrate_dma;
-		work.migrate_concur = migrate_concur;
-		sema_init(work.sem, 0);
+		work = (page_migration_to_remote_pmm_work_t*) kmalloc(sizeof(page_migration_to_remote_pmm_work_t), GFP_KERNEL);
+		INIT_WORK(&(work->work), page_migration_to_remote_pmm_worker);
+		work->mm = mm;
+		work->pagelist = pagelist;
+		work->node = node;
+		work->migrate_mt = migrate_mt;
+		work->migrate_dma = migrate_dma;
+		work->migrate_concur = migrate_concur;
+		work->sem = (struct semaphore*) kmalloc(sizeof(struct semaphore), GFP_KERNEL);
+		sema_init(work->sem, 0);
 
-		queue_work_on(get_nearest_cpu_node(node), page_migration_to_remote_pmm_wq, (struct work_struct*)&work);
-		down(work.sem);
-		flush_workqueue(page_migration_to_remote_pmm_wq);
-		destroy_workqueue(page_migration_to_remote_pmm_wq);
+		nearest_node = get_nearest_cpu_node(node);
+		if(nearest_node==-1){
+			err = -1;
+			printk("get_nearest_cpu_node(%d) returned -1!\n", node);
+			kfree(work->sem);
+			kfree(work);
+			goto out;
+		}
+		
+		printk("queue_work_on(%d, %p, %p) is goint to be called!\n", 
+			get_nearest_cpu_node(node), 
+			page_migration_to_remote_pmm_wq, 
+			(struct work_struct*)&(work->work)
+		);
+
+		// TODO: check if get_nearest_cpu_node(node) returns the node id which is available 
+		queue_work_on(get_nearest_cpu_node(node), page_migration_to_remote_pmm_wq, (struct work_struct*)&(work->work));
+		
+		printk("Work queued on %d.\n", get_nearest_cpu_node(node));
+		
+		// wait for the worker to finish the page migration
+		down(work->sem);
+		
+		kfree(work->sem);
+		kfree(work);
 	} else if (migrate_concur) {
 		err = migrate_pages_concur(pagelist, alloc_new_node_page, NULL, node,
 				MIGRATE_SYNC | (migrate_mt ? MIGRATE_MT : MIGRATE_SINGLETHREAD) |
 				(migrate_dma ? MIGRATE_DMA : MIGRATE_SINGLETHREAD),
 				MR_SYSCALL);
-
 	} else {
 		err = migrate_pages(pagelist, alloc_new_node_page, NULL, node,
 				MIGRATE_SYNC | (migrate_mt ? MIGRATE_MT : MIGRATE_SINGLETHREAD) |
@@ -2566,6 +2664,8 @@ static int do_pages_move(struct mm_struct *mm, nodemask_t task_nodes,
 #ifdef CONFIG_PAGE_MIGRATION_PROFILE
 	u64 timestamp;
 #endif
+
+	printk("do_pages_move() called!\n");
 
 	migrate_prep();
 
