@@ -13,8 +13,12 @@
 #include <linux/rmap.h>
 #include <linux/security.h>
 #include <linux/syscalls.h>
+#include <linux/semaphore.h>
+#include <linux/gfp.h>
 
 #include "internal.h"
+
+#include <linux/workqueue.h>
 
 int migration_batch_size = 16;
 
@@ -141,6 +145,12 @@ static unsigned long isolate_pages_from_lru_list(pg_data_t *pgdat,
 	return nr_all_taken;
 }
 
+extern unsigned int limit_mt_num;
+extern int accel_page_copy;
+extern int sysctl_enable_page_migration_optimization_avoid_remote_pmem_write;
+extern int CLOSEST_CPU_NODE_FOR_PMEM[];
+extern int CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED;
+
 static int migrate_to_node(struct list_head *page_list, int nid,
 		enum migrate_mode mode, int batch_size)
 {
@@ -149,6 +159,15 @@ static int migrate_to_node(struct list_head *page_list, int nid,
 	int num = 0;
 	int from_nid = -1;
 	int err;
+	
+	bool migrate_mt = mode & MIGRATE_MT;
+	bool migrate_dma = mode & MIGRATE_DMA;
+	extern struct workqueue_struct *page_migration_to_remote_pmm_wq;
+	page_migration_to_remote_pmm_work_t *work;
+	int temp, nearest_node;
+	int prev_limit_mt_num;
+	int node;
+	int src_node;
 
 	if (list_empty(page_list))
 		return num;
@@ -166,14 +185,101 @@ static int migrate_to_node(struct list_head *page_list, int nid,
 		}
 
 		from_nid = page_to_nid(list_first_entry(&batch_page_list, struct page, lru));
+		if(sysctl_enable_page_migration_optimization_avoid_remote_pmem_write==1){
+			node = nid;
+			src_node = from_nid;
+			if(is_remote_pmem_node(node)==1){
+				// TODO: schedule the task to appropriate work queue
+				//TODO: check if we need to tune the workqueue params
+				// printk("[migrate_to_node] is_remote_pmem_node(%d) returned 1!\n", node);
+				if (unlikely(!page_migration_to_remote_pmm_wq)) {
+					// printk("[migrate_to_node] page_migration_to_remote_pmm_wq not initialized!\n");
+					err = -ENOMEM;
+					goto out;
+				}
+				
+				// initialize work
+				work = (page_migration_to_remote_pmm_work_t*) kmalloc(sizeof(page_migration_to_remote_pmm_work_t), GFP_KERNEL);
+				if(unlikely(!work)){
+					err = -ENOMEM;
+					goto out;
+				}
+				INIT_WORK(&(work->work), page_migration_to_remote_pmm_worker);
+				work->pagelist = &batch_page_list;
+				work->node = node;
+				work->migrate_mt = migrate_mt;
+				work->migrate_dma = migrate_dma;
+				work->migrate_concur = migrate_concur;
+				work->sem = (struct semaphore*) kmalloc(sizeof(struct semaphore), GFP_KERNEL);
+				if(unlikely(!(work->sem))){
+					kfree(work);
+					err = -ENOMEM;
+					goto out;
+				}
+				sema_init(work->sem, 0);
 
-		if (migrate_concur)
+				nearest_node = get_nearest_cpu_node(node);
+				if(nearest_node==-1){
+					err = -1;
+					// printk("[migrate_to_node] get_nearest_cpu_node(%d) returned -1!\n", node);
+					kfree(work->sem);
+					kfree(work);
+					goto out;
+				}
+
+				// TODO: check if get_nearest_cpu_node(node) returns the node id which is available 
+				queue_work_on(get_nearest_cpu_node(node), page_migration_to_remote_pmm_wq, (struct work_struct*)&(work->work));
+				
+				// printk("[migrate_to_node] Work queued on %d.\n", get_nearest_cpu_node(node));
+				
+				// wait for the worker to finish the page migration
+				down(work->sem);
+				err = work->err;
+
+				kfree(work->sem);
+				kfree(work);
+			} /*else if(CLOSEST_CPU_NODE_FOR_PMEM[node]==-1 && CLOSEST_CPU_NODE_FOR_PMEM[src_node]==-1){
+				// DRAM to DRAM
+				// use 4 thread concurrent page migration
+				prev_limit_mt_num = limit_mt_num;
+				limit_mt_num = 4;
+				err = migrate_pages_concur(&batch_page_list, alloc_new_node_page, NULL, node,
+					MIGRATE_SYNC | (migrate_mt ? MIGRATE_MT : MIGRATE_SINGLETHREAD) |
+					(migrate_dma ? MIGRATE_DMA : MIGRATE_SINGLETHREAD),
+					MR_SYSCALL);
+				limit_mt_num = prev_limit_mt_num;
+			} else {
+				if(!(CLOSEST_CPU_NODE_FOR_PMEM[node]==-1 && CLOSEST_CPU_NODE_FOR_PMEM[src_node]!=-1))
+					printk("[migrate_to_node] This situation should not occur: "
+							"(CLOSEST_CPU_NODE_FOR_PMEM[node]==-1 && CLOSEST_CPU_NODE_FOR_PMEM[src_node]!=-1) is false in case of PMEM to DRAM case.\n");
+				// PMEM to DRAM
+				// use single thread concurrent page migration
+				prev_limit_mt_num = limit_mt_num;
+				limit_mt_num = 1;
+				migrate_mt = 0;
+				temp = accel_page_copy;
+				accel_page_copy = 0;
+				err = migrate_pages_concur(&batch_page_list, alloc_new_node_page, NULL, node,
+					MIGRATE_SYNC | (migrate_mt ? MIGRATE_MT : MIGRATE_SINGLETHREAD) |
+					(migrate_dma ? MIGRATE_DMA : MIGRATE_SINGLETHREAD),
+					MR_SYSCALL);
+				limit_mt_num = prev_limit_mt_num;
+				accel_page_copy = temp;
+			}*/
+			else if (migrate_concur)
+				err = migrate_pages_concur(&batch_page_list, alloc_new_node_page,
+					NULL, nid, mode, MR_SYSCALL);
+			else
+				err = migrate_pages(&batch_page_list, alloc_new_node_page,
+					NULL, nid, mode, MR_SYSCALL);
+		} else if (migrate_concur)
 			err = migrate_pages_concur(&batch_page_list, alloc_new_node_page,
 				NULL, nid, mode, MR_SYSCALL);
 		else
 			err = migrate_pages(&batch_page_list, alloc_new_node_page,
 				NULL, nid, mode, MR_SYSCALL);
 
+out:
 		if (err) {
 			struct page *page;
 

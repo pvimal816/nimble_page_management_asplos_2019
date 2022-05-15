@@ -59,7 +59,10 @@
 #include "internal.h"
 
 int accel_page_copy = 1;
-
+int sysctl_enable_page_migration_optimization_avoid_remote_pmem_write = 0;
+int CLOSEST_CPU_NODE_FOR_PMEM[MAX_NUMNODES];
+int CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED=0;
+EXPORT_SYMBOL(CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED);
 
 struct page_migration_work_item {
 	struct list_head list;
@@ -2302,10 +2305,6 @@ static int store_status(int __user *status, int start, int value, int nr)
  * nearest CPU node id for ith node if that node is a PMEM node.
  * Otherwise it should be -1.
  */
-int CLOSEST_CPU_NODE_FOR_PMEM[MAX_NUMNODES];
-int CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED=0;
-EXPORT_SYMBOL(CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED);
-
 SYSCALL_DEFINE2(init_closest_cpu_node_for_pmem_list, const int __user*, closest_cpu_node_for_pmemp, int, entry_count){
 	int i;
 	int ret = 0;
@@ -2426,14 +2425,6 @@ int get_current_cpu_node(){
 	return node;
 }
 
-/**
- * @brief Returns the id of the nearest cpu node of this node.
- * Because in some cases the given NUMA node might be a memory only NUMA node
- * for which it's non-trivial to find the corresponding CPU node.
- * @return int 
- */
-int get_nearest_cpu_node(int node);
-
 int get_nearest_cpu_node(int node){
 	init_closest_cpu_node_for_pmem_list_kernel();
 	if(CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED==0 || node < 0 || node >= MAX_NUMNODES)
@@ -2449,7 +2440,7 @@ int is_remote_pmem_node(int node){
 		// use init_closest_cpu_node_for_pmem_list to provide it.
 		printk("is_remote_pmem_node called with node value %d"
 			" but the CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED is 0.\n",
-			node, CLOSEST_CPU_NODE_FOR_PMEM_INITIALIZED);
+			node);
 		return -1;
 	}
 	if(nearest_cpu==cur_cpu)
@@ -2461,30 +2452,16 @@ int is_remote_pmem_node(int node){
 	return 1;
 }
 
-typedef struct {
-	struct work_struct work;
-	// extra data;
-	// TODO: declare a lock over here 
-	// so when the work gets finished the worker will unlock it.
-	struct mm_struct *mm;
-	struct list_head *pagelist;
-	u_int8_t node;
-	u_int8_t migrate_mt;
-	u_int8_t migrate_dma;
-	u_int8_t migrate_concur;
-	struct semaphore *sem;
-} page_migration_to_remote_pmm_work_t;
-
 /**
  * @brief This function is a worker which 
  * carries out the actual page migration.
  */
-static void page_migration_to_remote_pmm_worker(struct work_struct *work){
+void page_migration_to_remote_pmm_worker(struct work_struct *work){
 	// TODO: implement this
 	page_migration_to_remote_pmm_work_t* work_info = (page_migration_to_remote_pmm_work_t*) work;
 	printk("page_migration_to_remote_pmm_worker called!\n");
 	// TODO: invoke the page migration here
-	migrate_pages(work_info->pagelist, alloc_new_node_page, NULL, work_info->node,
+	work_info->err = migrate_pages(work_info->pagelist, alloc_new_node_page, NULL, work_info->node,
 				MIGRATE_SYNC | (work_info->migrate_mt ? MIGRATE_MT : MIGRATE_SINGLETHREAD) |
 				(work_info->migrate_dma ? MIGRATE_DMA : MIGRATE_SINGLETHREAD),
 				MR_SYSCALL);
@@ -2492,69 +2469,94 @@ static void page_migration_to_remote_pmm_worker(struct work_struct *work){
 	up(work_info->sem);
 }
 
-int sysctl_enable_page_migration_optimization_avoid_remote_pmem_write = 0;
+extern unsigned int limit_mt_num;
 
 static int do_move_pages_to_node(struct mm_struct *mm,
 		struct list_head *pagelist, int node,
-		bool migrate_mt, bool migrate_dma, bool migrate_concur)
+		bool migrate_mt, bool migrate_dma, bool migrate_concur, int src_node)
 {
 	int err=0, nearest_node;
 	extern struct workqueue_struct *page_migration_to_remote_pmm_wq;
 	page_migration_to_remote_pmm_work_t *work;
+	int temp;
+	int prev_limit_mt_num;
 
 	if (list_empty(pagelist))
 		goto out;
 
-	printk("do_move_pages_to_node called, with destination node=%d.\n", node);
-	if(sysctl_enable_page_migration_optimization_avoid_remote_pmem_write==1 && 
-		is_remote_pmem_node(node)==1
-	){
-		// TODO: schedule the task to appropriate work queue
-		//TODO: check if we need to tune the workqueue params
-		printk("is_remote_pmem_node(%d) returned 1!\n", node);
-		if (unlikely(!page_migration_to_remote_pmm_wq)) {
-			printk("page_migration_to_remote_pmm_wq not initialized!\n");
-			err = -ENOMEM;
-			goto out;
-		}
-		
-		// initialize work
-		work = (page_migration_to_remote_pmm_work_t*) kmalloc(sizeof(page_migration_to_remote_pmm_work_t), GFP_KERNEL);
-		INIT_WORK(&(work->work), page_migration_to_remote_pmm_worker);
-		work->mm = mm;
-		work->pagelist = pagelist;
-		work->node = node;
-		work->migrate_mt = migrate_mt;
-		work->migrate_dma = migrate_dma;
-		work->migrate_concur = migrate_concur;
-		work->sem = (struct semaphore*) kmalloc(sizeof(struct semaphore), GFP_KERNEL);
-		sema_init(work->sem, 0);
+	printk("[do_move_pages_to_node] destination node=%d, source_node=%d, pmem_optimization=%d, \n", node, src_node, sysctl_enable_page_migration_optimization_avoid_remote_pmem_write);
+	if(sysctl_enable_page_migration_optimization_avoid_remote_pmem_write==1){
+		if(is_remote_pmem_node(node)==1){
+			// TODO: schedule the task to appropriate work queue
+			//TODO: check if we need to tune the workqueue params
+			printk("is_remote_pmem_node(%d) returned 1!\n", node);
+			if (unlikely(!page_migration_to_remote_pmm_wq)) {
+				printk("page_migration_to_remote_pmm_wq not initialized!\n");
+				err = -ENOMEM;
+				goto out;
+			}
+			
+			// initialize work
+			work = (page_migration_to_remote_pmm_work_t*) kmalloc(sizeof(page_migration_to_remote_pmm_work_t), GFP_KERNEL);
+			INIT_WORK(&(work->work), page_migration_to_remote_pmm_worker);
+			work->pagelist = pagelist;
+			work->node = node;
+			work->migrate_mt = migrate_mt;
+			work->migrate_dma = migrate_dma;
+			work->migrate_concur = migrate_concur;
+			work->sem = (struct semaphore*) kmalloc(sizeof(struct semaphore), GFP_KERNEL);
+			sema_init(work->sem, 0);
 
-		nearest_node = get_nearest_cpu_node(node);
-		if(nearest_node==-1){
-			err = -1;
-			printk("get_nearest_cpu_node(%d) returned -1!\n", node);
+			nearest_node = get_nearest_cpu_node(node);
+			if(nearest_node==-1){
+				err = -1;
+				printk("get_nearest_cpu_node(%d) returned -1!\n", node);
+				kfree(work->sem);
+				kfree(work);
+				goto out;
+			}
+			
+			printk("queue_work_on(%d, %p, %p) is goint to be called!\n", 
+				get_nearest_cpu_node(node), 
+				page_migration_to_remote_pmm_wq, 
+				(struct work_struct*)&(work->work)
+			);
+
+			// TODO: check if get_nearest_cpu_node(node) returns the node id which is available 
+			queue_work_on(get_nearest_cpu_node(node), page_migration_to_remote_pmm_wq, (struct work_struct*)&(work->work));
+			
+			printk("Work queued on %d.\n", get_nearest_cpu_node(node));
+			
+			// wait for the worker to finish the page migration
+			down(work->sem);
+			err = work->err;
 			kfree(work->sem);
 			kfree(work);
-			goto out;
+		} else if(CLOSEST_CPU_NODE_FOR_PMEM[node]==-1 && CLOSEST_CPU_NODE_FOR_PMEM[src_node]==-1){
+			// DRAM to DRAM
+			// use 4 thread concurrent page migration
+			prev_limit_mt_num = limit_mt_num;
+			limit_mt_num = 4;
+			err = migrate_pages_concur(pagelist, alloc_new_node_page, NULL, node,
+				MIGRATE_SYNC | (migrate_mt ? MIGRATE_MT : MIGRATE_SINGLETHREAD) |
+				(migrate_dma ? MIGRATE_DMA : MIGRATE_SINGLETHREAD),
+				MR_SYSCALL);
+			limit_mt_num = prev_limit_mt_num;
+		} else if(CLOSEST_CPU_NODE_FOR_PMEM[node]==-1 && CLOSEST_CPU_NODE_FOR_PMEM[src_node]!=-1){
+			// PMEM to DRAM
+			// use single thread concurrent page migration
+			prev_limit_mt_num = limit_mt_num;
+			limit_mt_num = 1;
+			migrate_mt = 0;
+			temp = accel_page_copy;
+			accel_page_copy = 0;
+			err = migrate_pages_concur(pagelist, alloc_new_node_page, NULL, node,
+				MIGRATE_SYNC | (migrate_mt ? MIGRATE_MT : MIGRATE_SINGLETHREAD) |
+				(migrate_dma ? MIGRATE_DMA : MIGRATE_SINGLETHREAD),
+				MR_SYSCALL);
+			limit_mt_num = prev_limit_mt_num;
+			accel_page_copy = temp;
 		}
-		
-		printk("queue_work_on(%d, %p, %p) is goint to be called!\n", 
-			get_nearest_cpu_node(node), 
-			page_migration_to_remote_pmm_wq, 
-			(struct work_struct*)&(work->work)
-		);
-
-		// TODO: check if get_nearest_cpu_node(node) returns the node id which is available 
-		queue_work_on(get_nearest_cpu_node(node), page_migration_to_remote_pmm_wq, (struct work_struct*)&(work->work));
-		
-		printk("Work queued on %d.\n", get_nearest_cpu_node(node));
-		
-		// wait for the worker to finish the page migration
-		down(work->sem);
-		
-		kfree(work->sem);
-		kfree(work);
 	} else if (migrate_concur) {
 		err = migrate_pages_concur(pagelist, alloc_new_node_page, NULL, node,
 				MIGRATE_SYNC | (migrate_mt ? MIGRATE_MT : MIGRATE_SINGLETHREAD) |
@@ -2647,6 +2649,9 @@ out:
 	return err;
 }
 
+static void do_pages_stat_array(struct mm_struct *mm, unsigned long nr_pages,
+				const void __user **pages, int *status);
+
 /*
  * Migrate an array of page address onto an array of nodes and fill
  * the corresponding array of status.
@@ -2658,6 +2663,7 @@ static int do_pages_move(struct mm_struct *mm, nodemask_t task_nodes,
 			 int __user *status, int flags)
 {
 	int current_node = NUMA_NO_NODE;
+	int current_src_node = NUMA_NO_NODE;
 	LIST_HEAD(pagelist);
 	int start, i;
 	int err = 0, err1;
@@ -2681,16 +2687,22 @@ static int do_pages_move(struct mm_struct *mm, nodemask_t task_nodes,
 	for (i = start = 0; i < nr_pages; i++) {
 		const void __user *p;
 		unsigned long addr;
+		// destination node
 		int node;
+		// source node
+		int src_node;
 
 		err = -EFAULT;
 		if (get_user(p, pages + i))
 			goto out_flush;
 		if (get_user(node, nodes + i))
 			goto out_flush;
+		do_pages_stat_array(mm, 1, &p, &src_node);
 		addr = (unsigned long)untagged_addr(p);
 
 		err = -ENODEV;
+		if (src_node < 0 || src_node >= MAX_NUMNODES)
+			goto out_flush;
 		if (node < 0 || node >= MAX_NUMNODES)
 			goto out_flush;
 		if (!node_state(node, N_MEMORY))
@@ -2700,10 +2712,11 @@ static int do_pages_move(struct mm_struct *mm, nodemask_t task_nodes,
 		if (!node_isset(node, task_nodes))
 			goto out_flush;
 
-		if (current_node == NUMA_NO_NODE) {
+		if (current_node == NUMA_NO_NODE || current_src_node == NUMA_NO_NODE) {
+			current_src_node = src_node;
 			current_node = node;
 			start = i;
-		} else if (node != current_node) {
+		} else if (node != current_node || src_node != current_src_node) {
 #ifdef CONFIG_PAGE_MIGRATION_PROFILE
 			timestamp = rdtsc();
 			current->move_pages_breakdown.form_page_node_info_cycles += timestamp -
@@ -2713,7 +2726,7 @@ static int do_pages_move(struct mm_struct *mm, nodemask_t task_nodes,
 
 			err = do_move_pages_to_node(mm, &pagelist, current_node,
 				flags & MPOL_MF_MOVE_MT, flags & MPOL_MF_MOVE_DMA,
-				flags & MPOL_MF_MOVE_CONCUR);
+				flags & MPOL_MF_MOVE_CONCUR, current_src_node);
 			if (err) {
 				/*
 				 * Positive err means the number of failed
@@ -2732,7 +2745,7 @@ static int do_pages_move(struct mm_struct *mm, nodemask_t task_nodes,
 				goto out;
 			start = i;
 			current_node = node;
-
+			current_src_node = src_node;
 #ifdef CONFIG_PAGE_MIGRATION_PROFILE
 			timestamp = rdtsc();
 			current->move_pages_breakdown.store_page_status_cycles += timestamp -
@@ -2784,7 +2797,7 @@ static int do_pages_move(struct mm_struct *mm, nodemask_t task_nodes,
 
 		err = do_move_pages_to_node(mm, &pagelist, current_node,
 				flags & MPOL_MF_MOVE_MT, flags & MPOL_MF_MOVE_DMA,
-				flags & MPOL_MF_MOVE_CONCUR);
+				flags & MPOL_MF_MOVE_CONCUR, current_src_node);
 		if (err) {
 			if (err > 0)
 				err += nr_pages - i - 1;
@@ -2796,7 +2809,8 @@ static int do_pages_move(struct mm_struct *mm, nodemask_t task_nodes,
 				goto out;
 		}
 		current_node = NUMA_NO_NODE;
-
+		current_src_node = NUMA_NO_NODE;
+		
 #ifdef CONFIG_PAGE_MIGRATION_PROFILE
 		timestamp = rdtsc();
 		current->move_pages_breakdown.store_page_status_cycles += timestamp -
@@ -2822,7 +2836,7 @@ out_flush:
 	/* Make sure we do not overwrite the existing error */
 	err1 = do_move_pages_to_node(mm, &pagelist, current_node,
 				flags & MPOL_MF_MOVE_MT, flags & MPOL_MF_MOVE_DMA,
-				flags & MPOL_MF_MOVE_CONCUR);
+				flags & MPOL_MF_MOVE_CONCUR, current_src_node);
 	/*
 	 * Don't have to report non-attempted pages here since:
 	 *     - If the above loop is done gracefully all pages have been

@@ -212,4 +212,28 @@ void migrate_vma_finalize(struct migrate_vma *migrate);
 
 #endif /* CONFIG_MIGRATION */
 
+int is_remote_pmem_node(int node);
+typedef struct {
+	struct work_struct work;
+	// extra data;
+	// TODO: declare a lock over here 
+	// so when the work gets finished the worker will unlock it.
+	struct list_head *pagelist;
+	u_int8_t node;
+	u_int8_t migrate_mt;
+	u_int8_t migrate_dma;
+	u_int8_t migrate_concur;
+	struct semaphore *sem;
+	int err;
+} page_migration_to_remote_pmm_work_t;
+void page_migration_to_remote_pmm_worker(struct work_struct *work);
+
+/**
+ * @brief Returns the id of the nearest cpu node of this node.
+ * Because in some cases the given NUMA node might be a memory only NUMA node
+ * for which it's non-trivial to find the corresponding CPU node.
+ * @return int 
+ */
+int get_nearest_cpu_node(int node);
+
 #endif /* _LINUX_MIGRATE_H */
