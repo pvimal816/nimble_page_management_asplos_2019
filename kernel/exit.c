@@ -160,6 +160,8 @@ static void __exit_signal(struct task_struct *tsk)
 		dst.nr_migrations += src.nr_migrations;\
 		dst.nr_base_pages += src.nr_base_pages;\
 		dst.nr_huge_pages += src.nr_huge_pages;\
+		dst.ttl_time_spent_base_pages += src.ttl_time_spent_base_pages;\
+		dst.ttl_time_spent_huge_pages += src.ttl_time_spent_huge_pages;\
 	} while (0);
 
 #define ADD_PAGE_MIGRATION_STATS(dst, src)\

@@ -228,7 +228,7 @@ static int migrate_to_node(struct list_head *page_list, int nid,
 				}
 
 				// TODO: check if get_nearest_cpu_node(node) returns the node id which is available 
-				queue_work_on(get_nearest_cpu_node(node), page_migration_to_remote_pmm_wq, (struct work_struct*)&(work->work));
+				queue_work_on(get_nearest_cpu_node(node), system_highpri_wq, (struct work_struct*)&(work->work));
 				
 				// printk("[migrate_to_node] Work queued on %d.\n", get_nearest_cpu_node(node));
 				
@@ -266,7 +266,63 @@ static int migrate_to_node(struct list_head *page_list, int nid,
 				limit_mt_num = prev_limit_mt_num;
 				accel_page_copy = temp;
 			}*/
-			else if (migrate_concur)
+			else if(0 && is_remote_pmem_node(src_node)==1){
+				// sometimes source node itself can be a remote pmem node
+				// So, check for that and in that case migrate a thread to 
+				// that remote pmem node
+				// TODO: schedule the task to appropriate work queue
+				//TODO: check if we need to tune the workqueue params
+				// printk("[migrate_to_node] is_remote_pmem_node(%d) returned 1!\n", node);
+				pr_debug("[migrate_to_node] Scheduling migration task to remote pmeme node which is source node of the migration!\n");
+				if (unlikely(!page_migration_to_remote_pmm_wq)) {
+					// printk("[migrate_to_node] page_migration_to_remote_pmm_wq not initialized!\n");
+					err = -ENOMEM;
+					goto out;
+				}
+				
+				// initialize work
+				work = (page_migration_to_remote_pmm_work_t*) kmalloc(sizeof(page_migration_to_remote_pmm_work_t), GFP_KERNEL);
+				if(unlikely(!work)){
+					pr_debug("[migrate_to_node] Unable to allocate memory for work object!\n");
+					err = -ENOMEM;
+					goto out;
+				}
+				INIT_WORK(&(work->work), page_migration_to_remote_pmm_worker);
+				work->pagelist = &batch_page_list;
+				work->node = node;
+				work->migrate_mt = migrate_mt;
+				work->migrate_dma = migrate_dma;
+				work->migrate_concur = migrate_concur;
+				work->sem = (struct semaphore*) kmalloc(sizeof(struct semaphore), GFP_KERNEL);
+				if(unlikely(!(work->sem))){
+					pr_debug("[migrate_to_node] Unable to allocate memory for work->sem object!\n");
+					kfree(work);
+					err = -ENOMEM;
+					goto out;
+				}
+				sema_init(work->sem, 0);
+
+				nearest_node = get_nearest_cpu_node(src_node);
+				if(nearest_node==-1){
+					err = -1;
+					pr_debug("[migrate_to_node] get_nearest_cpu_node(%d) returned -1, so will not schedule this migration!\n", src_node);
+					kfree(work->sem);
+					kfree(work);
+					goto out;
+				}
+
+				// TODO: check if get_nearest_cpu_node(node) returns the node id which is available 
+				queue_work_on(get_nearest_cpu_node(src_node), system_highpri_wq, (struct work_struct*)&(work->work));
+				
+				// printk("[migrate_to_node] Work queued on %d.\n", get_nearest_cpu_node(node));
+				
+				// wait for the worker to finish the page migration
+				down(work->sem);
+				err = work->err;
+
+				kfree(work->sem);
+				kfree(work);
+			} else if (migrate_concur)
 				err = migrate_pages_concur(&batch_page_list, alloc_new_node_page,
 					NULL, nid, mode, MR_SYSCALL);
 			else
@@ -512,7 +568,8 @@ static int do_mm_manage(struct task_struct *p, struct mm_struct *mm,
 	bool migrate_concur = flags & MPOL_MF_MOVE_CONCUR;
 	bool migrate_dma = flags & MPOL_MF_MOVE_DMA;
 	bool move_hot_and_cold_pages = flags & MPOL_MF_MOVE_ALL;
-	bool migrate_exchange_pages = flags & MPOL_MF_EXCHANGE;
+	bool migrate_exchange_pages = flags & MPOL_MF_EXCHANGE || (sysctl_enable_page_migration_optimization_avoid_remote_pmem_write==1);
+	u64 timestamp;
 	/*bool migrate_pages_out = false;*/
 	struct mem_cgroup *memcg = mem_cgroup_from_task(p);
 	int err = 0;
@@ -603,6 +660,7 @@ static int do_mm_manage(struct task_struct *p, struct mm_struct *mm,
 			 * base pages can include file-backed ones, we do not handle them
 			 * at the moment
 			 */
+			timestamp = rdtsc();
 			if (!thp_migration_supported()) {
 				nr_exchange_pages =  exchange_pages_between_nodes(nr_isolated_from_base_pages,
 					nr_isolated_to_base_pages, &from_base_page_list,
@@ -612,11 +670,14 @@ static int do_mm_manage(struct task_struct *p, struct mm_struct *mm,
 
 				p->page_migration_stats.nr_exchange_base_pages += nr_exchange_pages;
 			}
+			p->page_migration_stats.f2s.ttl_time_spent_base_pages += rdtsc() - timestamp;
 
 			/* THP page exchange */
+			timestamp = rdtsc();
 			nr_exchange_pages =  exchange_pages_between_nodes(nr_isolated_from_huge_pages,
 				nr_isolated_to_huge_pages, &from_huge_page_list,
 				&to_huge_page_list, migration_batch_size, true, mode);
+			p->page_migration_stats.f2s.ttl_time_spent_huge_pages += rdtsc() - timestamp;
 
 			if (!thp_migration_supported()) {
 			/* split THP above, so we do not need to multiply the counter */
@@ -632,20 +693,31 @@ static int do_mm_manage(struct task_struct *p, struct mm_struct *mm,
 			goto migrate_out;
 		} else {
 migrate_out:
+
 			if (migrate_mt || migrate_concur) {
+				timestamp = rdtsc();
 				nr_isolated_to_base_pages -=
 					migrate_to_node(&to_base_page_list, from_nid, mode & ~MIGRATE_MT,
 						migration_batch_size);
+				p->page_migration_stats.f2s.ttl_time_spent_base_pages += rdtsc() - timestamp;
+				
+				timestamp = rdtsc();
 				nr_isolated_to_huge_pages -=
 					migrate_to_node(&to_huge_page_list, from_nid, mode,
 						migration_batch_size);
+				p->page_migration_stats.f2s.ttl_time_spent_huge_pages += rdtsc() - timestamp;
 			} else {
+				timestamp = rdtsc();
 				nr_isolated_to_base_pages -=
 					migrate_to_node(&to_base_page_list, from_nid, mode,
 						migration_batch_size);
+				p->page_migration_stats.f2s.ttl_time_spent_base_pages += rdtsc() - timestamp;
+				
+				timestamp = rdtsc();
 				nr_isolated_to_huge_pages -=
 					migrate_to_node(&to_huge_page_list, from_nid, mode,
 						migration_batch_size);
+				p->page_migration_stats.f2s.ttl_time_spent_huge_pages += rdtsc() - timestamp;
 #if 0
 				/* migrate base pages and THPs together if no opt is used */
 				if (!list_empty(&to_huge_page_list)) {
@@ -689,19 +761,29 @@ migrate_out:
 		pr_info("%ld free pages at to node: %d\n", nr_free_pages_to_node, to_nid);
 
 	if (migrate_mt || migrate_concur) {
+		timestamp = rdtsc();
 		nr_isolated_from_base_pages -=
 			migrate_to_node(&from_base_page_list, to_nid, mode & ~MIGRATE_MT,
 				migration_batch_size);
+		p->page_migration_stats.s2f.ttl_time_spent_base_pages += rdtsc() - timestamp;
+		
+		timestamp = rdtsc();
 		nr_isolated_from_huge_pages -=
 			migrate_to_node(&from_huge_page_list, to_nid, mode,
 				migration_batch_size);
+		p->page_migration_stats.s2f.ttl_time_spent_huge_pages += rdtsc() - timestamp;
 	} else {
+		timestamp = rdtsc();
 		nr_isolated_from_base_pages -=
 			migrate_to_node(&from_base_page_list, to_nid, mode,
 				migration_batch_size);
+		p->page_migration_stats.s2f.ttl_time_spent_base_pages += rdtsc() - timestamp;
+		
+		timestamp = rdtsc();
 		nr_isolated_from_huge_pages -=
 			migrate_to_node(&from_huge_page_list, to_nid, mode,
 				migration_batch_size);
+		p->page_migration_stats.s2f.ttl_time_spent_huge_pages += rdtsc() - timestamp;
 #if 0
 		/* migrate base pages and THPs together if no opt is used */
 		if (!list_empty(&from_huge_page_list)) {

@@ -90,6 +90,8 @@ struct page_migration_counters {
 	unsigned long nr_migrations;
 	unsigned long nr_base_pages;
 	unsigned long nr_huge_pages;
+	u64 ttl_time_spent_base_pages;
+	u64 ttl_time_spent_huge_pages;
 };
 
 struct page_migration_stats {

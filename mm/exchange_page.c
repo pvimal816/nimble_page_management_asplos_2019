@@ -11,6 +11,8 @@
 #include <linux/slab.h>
 #include <linux/freezer.h>
 
+#include <linux/migrate.h>
+
 /*
  * nr_copythreads can be the highest number of threads for given node
  * on any architecture. The actual number of copy threads will be
@@ -113,22 +115,49 @@ int exchange_page_mthread(struct page *to, struct page *from, int nr_pages)
 	return 0;
 }
 
+extern int sysctl_enable_page_migration_optimization_avoid_remote_pmem_write;
+
 int exchange_page_lists_mthread(struct page **to, struct page **from, int nr_pages) 
 {
 	int err = 0;
 	int total_mt_num = limit_mt_num;
-#ifdef CONFIG_PAGE_MIGRATION_PROFILE
-	int to_node = page_to_nid(*to);
-#else
-	int to_node = numa_node_id();
-#endif
+	int to_node, from_node, node_selected_for_migration_processing;
+	
+// #ifdef CONFIG_PAGE_MIGRATION_PROFILE
+// 	int to_node = page_to_nid(*to);
+// #else
+// 	int to_node = numa_node_id();
+// #endif
 	int i;
 	struct copy_page_info *work_items;
-	const struct cpumask *per_node_cpumask = cpumask_of_node(to_node);
+	const struct cpumask *per_node_cpumask;
 	int cpu_id_list[32] = {0};
 	int cpu;
 	int item_idx;
 
+	from_node = page_to_nid(*from);
+	to_node = page_to_nid(*to);
+
+	per_node_cpumask = cpumask_of_node(node_selected_for_migration_processing=numa_node_id());
+
+	if(sysctl_enable_page_migration_optimization_avoid_remote_pmem_write){
+		int from_node_cpu_count = cpumask_weight(cpumask_of_node(from_node));
+		int to_node_cpu_count = cpumask_weight(cpumask_of_node(to_node));
+		
+		pr_debug("[exchange_page_lists_mthread-current_cpu_node=%d] PMEM optimization enabled: from_node_cpu_count=%d, to_node_cpu_count=%d\n", 
+			numa_node_id(), from_node_cpu_count, to_node_cpu_count);
+		pr_debug("[exchange_page_lists_mthread] PMEM optimization enabled: get_nearest_cpu_node(%d)=%d, get_nearest_cpu_node(%d)=%d\n", 
+			from_node, get_nearest_cpu_node(from_node), to_node, get_nearest_cpu_node(to_node));
+		
+		if(get_nearest_cpu_node(from_node)!=-1){
+			// from_node is pmem only memory node
+			per_node_cpumask = cpumask_of_node(cpu_to_node(get_nearest_cpu_node(from_node)));
+			node_selected_for_migration_processing = cpu_to_node(get_nearest_cpu_node(from_node));
+		} else if(get_nearest_cpu_node(to_node)!=-1) {
+			per_node_cpumask = cpumask_of_node(cpu_to_node(get_nearest_cpu_node(to_node)));
+			node_selected_for_migration_processing = cpu_to_node(get_nearest_cpu_node(to_node));
+		}
+	}
 
 	total_mt_num = min_t(unsigned int, total_mt_num,
 						 cpumask_weight(per_node_cpumask));
@@ -210,6 +239,8 @@ int exchange_page_lists_mthread(struct page **to, struct page **from, int nr_pag
 			queue_work_on(cpu_id_list[thread_idx], system_highpri_wq, (struct work_struct *)&work_items[i]);
 		}
 	}
+
+	pr_debug("[exchange_page_lists_mthread-current_cpu_node=%d] Scheduled the mt-%d exchange operation between node %d and %d on CPU close to node %d!\n", numa_node_id(), total_mt_num, from_node, to_node, node_selected_for_migration_processing);
 
 	/* Wait until it finishes  */
 	flush_workqueue(system_highpri_wq);

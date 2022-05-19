@@ -2459,7 +2459,7 @@ int is_remote_pmem_node(int node){
 void page_migration_to_remote_pmm_worker(struct work_struct *work){
 	// TODO: implement this
 	page_migration_to_remote_pmm_work_t* work_info = (page_migration_to_remote_pmm_work_t*) work;
-	printk("page_migration_to_remote_pmm_worker called!\n");
+	pr_debug("[page_migration_to_remote_pmm_worker] current node: %d, destination node: %d\n", get_current_cpu_node(), work_info->node);
 	// TODO: invoke the page migration here
 	work_info->err = migrate_pages(work_info->pagelist, alloc_new_node_page, NULL, work_info->node,
 				MIGRATE_SYNC | (work_info->migrate_mt ? MIGRATE_MT : MIGRATE_SINGLETHREAD) |
@@ -2484,8 +2484,9 @@ static int do_move_pages_to_node(struct mm_struct *mm,
 	if (list_empty(pagelist))
 		goto out;
 
-	printk("[do_move_pages_to_node] destination node=%d, source_node=%d, pmem_optimization=%d, \n", node, src_node, sysctl_enable_page_migration_optimization_avoid_remote_pmem_write);
-	if(sysctl_enable_page_migration_optimization_avoid_remote_pmem_write==1){
+	pr_debug("[do_move_pages_to_node] destination node=%d, source_node=%d, pmem_optimization=%d, \n", node, src_node, sysctl_enable_page_migration_optimization_avoid_remote_pmem_write);
+	// as of now disable this optimization till we test the exchange optimization
+	if(0 && sysctl_enable_page_migration_optimization_avoid_remote_pmem_write==1){
 		if(is_remote_pmem_node(node)==1){
 			// TODO: schedule the task to appropriate work queue
 			//TODO: check if we need to tune the workqueue params
