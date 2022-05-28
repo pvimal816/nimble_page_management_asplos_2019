@@ -48,21 +48,39 @@ static void exchange_page_work_queue_thread(struct work_struct *work)
 							  my_work->chunk_size);
 }
 
+extern int sysctl_enable_page_migration_optimization_avoid_remote_pmem_write;
+
 int exchange_page_mthread(struct page *to, struct page *from, int nr_pages)
 {
 	int total_mt_num = limit_mt_num;
-#ifdef CONFIG_PAGE_MIGRATION_PROFILE
-	int to_node = page_to_nid(to);
-#else
-	int to_node = numa_node_id();
-#endif
+	int to_node, from_node;
+
+// #ifdef CONFIG_PAGE_MIGRATION_PROFILE
+// 	int to_node = page_to_nid(to);
+// #else
+// 	int to_node = numa_node_id();
+// #endif
 	int i;
 	struct copy_page_info *work_items;
 	char *vto, *vfrom;
 	unsigned long chunk_size;
-	const struct cpumask *per_node_cpumask = cpumask_of_node(to_node);
+	const struct cpumask *per_node_cpumask;
 	int cpu_id_list[32] = {0};
 	int cpu;
+
+	from_node = page_to_nid(from);
+	to_node = page_to_nid(to);
+
+	per_node_cpumask = cpumask_of_node(numa_node_id());
+
+	if(sysctl_enable_page_migration_optimization_avoid_remote_pmem_write){
+		if(get_nearest_cpu_node(from_node)!=-1){
+			// from_node is pmem only memory node
+			per_node_cpumask = cpumask_of_node(cpu_to_node(get_nearest_cpu_node(from_node)));
+		} else if(get_nearest_cpu_node(to_node)!=-1) {
+			per_node_cpumask = cpumask_of_node(cpu_to_node(get_nearest_cpu_node(to_node)));
+		}
+	}
 
 	total_mt_num = min_t(unsigned int, total_mt_num,
 						 cpumask_weight(per_node_cpumask));
@@ -115,10 +133,12 @@ int exchange_page_mthread(struct page *to, struct page *from, int nr_pages)
 	return 0;
 }
 
-extern int sysctl_enable_page_migration_optimization_avoid_remote_pmem_write;
+long long int total_base_pages_exchanged;
+long long int total_time_taken_in_exchange;
+int sysctl_reset_bandwidth_counters;
 
-int exchange_page_lists_mthread(struct page **to, struct page **from, int nr_pages) 
-{
+int exchange_page_lists_mthread(struct page **to, struct page **from, int nr_pages)
+{	
 	int err = 0;
 	int total_mt_num = limit_mt_num;
 	int to_node, from_node, node_selected_for_migration_processing;
@@ -135,6 +155,10 @@ int exchange_page_lists_mthread(struct page **to, struct page **from, int nr_pag
 	int cpu;
 	int item_idx;
 
+	long long int timestamp;
+	long long int nr_pages_backup = nr_pages;
+	timestamp = rdtsc();
+
 	from_node = page_to_nid(*from);
 	to_node = page_to_nid(*to);
 
@@ -144,8 +168,8 @@ int exchange_page_lists_mthread(struct page **to, struct page **from, int nr_pag
 		int from_node_cpu_count = cpumask_weight(cpumask_of_node(from_node));
 		int to_node_cpu_count = cpumask_weight(cpumask_of_node(to_node));
 		
-		pr_debug("[exchange_page_lists_mthread-current_cpu_node=%d] PMEM optimization enabled: from_node_cpu_count=%d, to_node_cpu_count=%d\n", 
-			numa_node_id(), from_node_cpu_count, to_node_cpu_count);
+		pr_debug("[exchange_page_lists_mthread-current_cpu_node=%d] PMEM optimization enabled: nr_pages=%d, limit_mt_num=%d, from_node_cpu_count=%d, to_node_cpu_count=%d\n", 
+			numa_node_id(), nr_pages, limit_mt_num, from_node_cpu_count, to_node_cpu_count);
 		pr_debug("[exchange_page_lists_mthread] PMEM optimization enabled: get_nearest_cpu_node(%d)=%d, get_nearest_cpu_node(%d)=%d\n", 
 			from_node, get_nearest_cpu_node(from_node), to_node, get_nearest_cpu_node(to_node));
 		
@@ -244,6 +268,15 @@ int exchange_page_lists_mthread(struct page **to, struct page **from, int nr_pag
 
 	/* Wait until it finishes  */
 	flush_workqueue(system_highpri_wq);
+
+	if(sysctl_reset_bandwidth_counters){
+		total_base_pages_exchanged = 0;
+		total_time_taken_in_exchange = 0;
+		sysctl_reset_bandwidth_counters = 0;
+	}
+	total_base_pages_exchanged += hpage_nr_pages(to[0])*nr_pages_backup;
+	total_time_taken_in_exchange += rdtsc() - timestamp;
+	pr_debug("[exchange_page_lists_mthread] Current exchange bandhwidth: %d KB/GCycles\n", total_base_pages_exchanged*4*1000000000/total_time_taken_in_exchange);
 
 	for (i = 0; i < nr_pages; ++i) {
 			kunmap(to[i]);

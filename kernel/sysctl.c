@@ -334,6 +334,13 @@ static struct ctl_table kern_table[] = {
 		.proc_handler = proc_dointvec,
 	},
 	{
+		.procname = "reset_bandwidth_counters",
+		.data = &sysctl_reset_bandwidth_counters,
+		.maxlen = sizeof(int),
+		.mode = 0644,
+		.proc_handler = proc_dointvec,
+	},
+	{
 		.procname	= "sched_child_runs_first",
 		.data		= &sysctl_sched_child_runs_first,
 		.maxlen		= sizeof(unsigned int),
