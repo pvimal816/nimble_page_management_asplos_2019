@@ -13,6 +13,10 @@
 
 #include <linux/migrate.h>
 
+#define _MM_MALLOC_H_INCLUDED 
+#include <immintrin.h>
+#undef _MM_MALLOC_H_INCLUDED 
+
 /*
  * nr_copythreads can be the highest number of threads for given node
  * on any architecture. The actual number of copy threads will be
@@ -27,8 +31,38 @@ struct copy_page_info {
 	unsigned long chunk_size;
 };
 
+
+int sysctl_enable_nt_exchange = 0;
+
+__attribute__((optimize("-O3")))
+__attribute__((target("avx512vl,bmi2")))
 static void exchange_page_routine(char *to, char *from, unsigned long chunk_size)
 {
+#ifdef CONFIG_AS_AVX512
+	if(sysctl_enable_nt_exchange==1){
+		// use non-temporal load/stores
+		__m512i_u* s = (__m512i_u*)from;
+		__m512i_u* d = (__m512i_u*)to;
+		__m512i_u temp;
+		unsigned long i;
+		
+		for(i=0; i<chunk_size; i+=64){
+			temp =  _mm512_stream_load_si512(s);
+			_mm512_stream_si512(s, _mm512_stream_load_si512(d));
+			_mm512_stream_si512(d, temp);
+			s++, d++;
+		} 
+	} else {
+		u64 tmp;
+		int i;
+
+		for (i = 0; i < chunk_size; i += sizeof(tmp)) {
+			tmp = *((u64*)(from + i));
+			*((u64*)(from + i)) = *((u64*)(to + i));
+			*((u64*)(to + i)) = tmp;
+		}
+	}
+#else
 	u64 tmp;
 	int i;
 
@@ -36,16 +70,18 @@ static void exchange_page_routine(char *to, char *from, unsigned long chunk_size
 		tmp = *((u64*)(from + i));
 		*((u64*)(from + i)) = *((u64*)(to + i));
 		*((u64*)(to + i)) = tmp;
-	}
+	}	
+#endif
 }
 
 static void exchange_page_work_queue_thread(struct work_struct *work)
 {
 	struct copy_page_info *my_work = (struct copy_page_info*)work;
-
+	kernel_fpu_begin();
 	exchange_page_routine(my_work->to,
 							  my_work->from,
 							  my_work->chunk_size);
+	kernel_fpu_end();
 }
 
 extern int sysctl_enable_page_migration_optimization_avoid_remote_pmem_write;
@@ -74,11 +110,11 @@ int exchange_page_mthread(struct page *to, struct page *from, int nr_pages)
 	per_node_cpumask = cpumask_of_node(numa_node_id());
 
 	if(sysctl_enable_page_migration_optimization_avoid_remote_pmem_write){
-		if(get_nearest_cpu_node(from_node)!=-1){
+		if(get_nearest_cpu_node(to_node)!=-1){
 			// from_node is pmem only memory node
-			per_node_cpumask = cpumask_of_node(cpu_to_node(get_nearest_cpu_node(from_node)));
-		} else if(get_nearest_cpu_node(to_node)!=-1) {
 			per_node_cpumask = cpumask_of_node(cpu_to_node(get_nearest_cpu_node(to_node)));
+		} else if(get_nearest_cpu_node(from_node)!=-1) {
+			per_node_cpumask = cpumask_of_node(cpu_to_node(get_nearest_cpu_node(from_node)));
 		}
 	}
 
@@ -173,13 +209,13 @@ int exchange_page_lists_mthread(struct page **to, struct page **from, int nr_pag
 		pr_debug("[exchange_page_lists_mthread] PMEM optimization enabled: get_nearest_cpu_node(%d)=%d, get_nearest_cpu_node(%d)=%d\n", 
 			from_node, get_nearest_cpu_node(from_node), to_node, get_nearest_cpu_node(to_node));
 		
-		if(get_nearest_cpu_node(from_node)!=-1){
+		if(get_nearest_cpu_node(to_node)!=-1){
 			// from_node is pmem only memory node
-			per_node_cpumask = cpumask_of_node(cpu_to_node(get_nearest_cpu_node(from_node)));
-			node_selected_for_migration_processing = cpu_to_node(get_nearest_cpu_node(from_node));
-		} else if(get_nearest_cpu_node(to_node)!=-1) {
-			per_node_cpumask = cpumask_of_node(cpu_to_node(get_nearest_cpu_node(to_node)));
 			node_selected_for_migration_processing = cpu_to_node(get_nearest_cpu_node(to_node));
+			per_node_cpumask = cpumask_of_node(node_selected_for_migration_processing);
+		} else if(get_nearest_cpu_node(from_node)!=-1) {
+			node_selected_for_migration_processing = cpu_to_node(get_nearest_cpu_node(from_node));
+			per_node_cpumask = cpumask_of_node(node_selected_for_migration_processing);
 		}
 	}
 

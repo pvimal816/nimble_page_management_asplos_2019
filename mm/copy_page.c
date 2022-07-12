@@ -14,6 +14,11 @@
 
 #include <linux/migrate.h>
 
+
+#define _MM_MALLOC_H_INCLUDED 
+#include <immintrin.h>
+#undef _MM_MALLOC_H_INCLUDED 
+
 unsigned int limit_mt_num = 4;
 
 /* ======================== multi-threaded copy page ======================== */
@@ -30,21 +35,38 @@ struct copy_page_info {
 	struct copy_item item_list[0];
 };
 
+int sysctl_enable_nt_page_copy=0;
+
+__attribute__((optimize("-O3")))
+__attribute__((target("avx512vl,bmi2")))
 static void copy_page_routine(char *vto, char *vfrom,
 	unsigned long chunk_size)
 {
+#ifdef CONFIG_AS_AVX512
+	if(sysctl_enable_nt_page_copy==1){
+		__m512i_u* s = (__m512i_u*)vfrom;
+		__m512i_u* d = (__m512i_u*)vto;
+		unsigned long i;
+		for(i=0; i<chunk_size; i+=64)
+			_mm512_stream_si512(d++, _mm512_stream_load_si512(s++));
+	}else{
+		memcpy(vto, vfrom, chunk_size);
+	}
+#else
 	memcpy(vto, vfrom, chunk_size);
+#endif
 }
 
 static void copy_page_work_queue_thread(struct work_struct *work)
 {
 	struct copy_page_info *my_work = (struct copy_page_info *)work;
 	int i;
-
+	kernel_fpu_begin();
 	for (i = 0; i < my_work->num_items; ++i)
 		copy_page_routine(my_work->item_list[i].to,
 						  my_work->item_list[i].from,
 						  my_work->item_list[i].chunk_size);
+	kernel_fpu_end();
 }
 
 extern int sysctl_enable_page_migration_optimization_avoid_remote_pmem_write;
@@ -52,11 +74,12 @@ extern int sysctl_enable_page_migration_optimization_avoid_remote_pmem_write;
 int copy_page_multithread(struct page *to, struct page *from, int nr_pages)
 {
 	unsigned int total_mt_num = limit_mt_num;
-#ifdef CONFIG_PAGE_MIGRATION_PROFILE
-	int to_node = page_to_nid(to);
-#else
-	int to_node = numa_node_id();
-#endif
+	int to_node, from_node, node_selected_for_migration_processing;
+// #ifdef CONFIG_PAGE_MIGRATION_PROFILE
+// 	int to_node = page_to_nid(to);
+// #else
+// 	int to_node = numa_node_id();
+// #endif
 	int i;
 	struct copy_page_info *work_items[32] = {0};
 	char *vto, *vfrom;
@@ -66,30 +89,30 @@ int copy_page_multithread(struct page *to, struct page *from, int nr_pages)
 	int cpu;
 	int err = 0;
 
+	per_node_cpumask = cpumask_of_node(node_selected_for_migration_processing = numa_node_id());
+
+	from_node = page_to_nid(from);
+	to_node = page_to_nid(to);
+
+	// per_node_cpumask = cpumask_of_node(to_node);
+
 	if(sysctl_enable_page_migration_optimization_avoid_remote_pmem_write){
-		to_node = page_to_nid(to);
-	}else{
-		to_node = numa_node_id();
-	}
-
-	per_node_cpumask = cpumask_of_node(to_node);	
-
-	pr_debug("[copy_page_multithread] scheduling the mt page copy operation on CPU close to node %d!\n", to_node);
-
-	if(!cpumask_weight(per_node_cpumask)){
-		// this is a memory only NUMA node, so just find the closest node having a CPU
-		if(get_nearest_cpu_node(to_node)==-1){
-			printk(KERN_WARNING "[copy_page_multithread] Unexpected situation occured: target memory only node does not have any closest CPU node known to us!\n");
-			return -1;
+		if(get_nearest_cpu_node(to_node)!=-1){
+			node_selected_for_migration_processing = cpu_to_node(get_nearest_cpu_node(to_node));
+			per_node_cpumask = cpumask_of_node(node_selected_for_migration_processing);
+		}else if(get_nearest_cpu_node(from_node)!=-1){
+			node_selected_for_migration_processing = cpu_to_node(get_nearest_cpu_node(from_node));
+			per_node_cpumask = cpumask_of_node(node_selected_for_migration_processing);
 		}
-		else
-			per_node_cpumask = cpumask_of_node(get_nearest_cpu_node(to_node));
 	}
+
 
 	total_mt_num = min_t(unsigned int, total_mt_num,
 						 cpumask_weight(per_node_cpumask));
 	if (total_mt_num > 1)
 		total_mt_num = (total_mt_num / 2) * 2;
+
+	pr_debug("[copy_page_multithread] total_mt_num: %d, processing_node: %d, src_node: %d, dst_node: %d\n", total_mt_num, node_selected_for_migration_processing, from_node, to_node);
 
 	if (total_mt_num > 32 || total_mt_num < 1)
 		return -ENODEV;
@@ -148,7 +171,8 @@ int copy_page_lists_mt(struct page **to, struct page **from, int nr_items)
 {
 	int err = 0;
 	unsigned int total_mt_num = limit_mt_num;
-	int to_node;
+	int to_node, from_node, node_selected_for_migration_processing;
+
 // #ifdef CONFIG_PAGE_MIGRATION_PROFILE
 // 	int to_node = page_to_nid(*to);
 // #else
@@ -162,31 +186,28 @@ int copy_page_lists_mt(struct page **to, struct page **from, int nr_items)
 	int max_items_per_thread;
 	int item_idx;
 
-	if(sysctl_enable_page_migration_optimization_avoid_remote_pmem_write){
-		to_node = page_to_nid(*to);
-	}else{
-		to_node = numa_node_id();
-	}
-	
-	per_node_cpumask = cpumask_of_node(to_node);
+	from_node = page_to_nid(*from);
+	to_node = page_to_nid(*to);
 
-	pr_debug("[copy_page_lists_mt] scheduling the concurrent page copy operation on a CPU close to node %d!\n", to_node);
+	per_node_cpumask = cpumask_of_node(node_selected_for_migration_processing=numa_node_id());
 	
-	if(!cpumask_weight(per_node_cpumask)){
-		// this is a memory only NUMA node, so just find the closest node having a CPU
-		if(get_nearest_cpu_node(to_node)==-1){
-			printk(KERN_WARNING "[copy_page_lists_mt] Unexpected situation occured: target memory only node does not have any closest CPU node known to us!\n");
-			return -1;
+	if(sysctl_enable_page_migration_optimization_avoid_remote_pmem_write){
+		if(get_nearest_cpu_node(to_node)!=-1){
+			// from_node is pmem only memory node
+			node_selected_for_migration_processing = cpu_to_node(get_nearest_cpu_node(to_node));
+			per_node_cpumask = cpumask_of_node(node_selected_for_migration_processing);
+		} else if(get_nearest_cpu_node(from_node)!=-1) {
+			node_selected_for_migration_processing = cpu_to_node(get_nearest_cpu_node(from_node));
+			per_node_cpumask = cpumask_of_node(node_selected_for_migration_processing);
 		}
-		else
-			per_node_cpumask = cpumask_of_node(get_nearest_cpu_node(to_node));
 	}
 
 	total_mt_num = min_t(unsigned int, total_mt_num,
 						 cpumask_weight(per_node_cpumask));
 
+	pr_debug("[copy_page_lists_mt] total_mt_num: %d, processing_node: %d, src_node: %d, dst_node: %d\n", total_mt_num, node_selected_for_migration_processing, from_node, to_node);
 
-	if (total_mt_num > 32)
+	if (total_mt_num > 32 || total_mt_num < 1)
 		return -ENODEV;
 
 	/* Each threads get part of each page, if nr_items < totla_mt_num */
